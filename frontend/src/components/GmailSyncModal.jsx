@@ -1,6 +1,8 @@
 import { X, Mail, Info } from 'lucide-react'
+import { useAuth } from '../context/AuthContext'
 
 export default function GmailSyncModal({ onClose }) {
+  const { user } = useAuth()
   return (
     <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <div className="bg-slate-800 rounded-2xl border border-slate-700 w-full max-w-md shadow-2xl">
@@ -44,7 +46,7 @@ export default function GmailSyncModal({ onClose }) {
               </span>
             </p>
             <p className="text-xs text-slate-500 mt-2">
-              Claude has access to your Gmail (tanjunhengonly@gmail.com) in this session
+              Claude has access to your Gmail ({user?.email ?? 'your Gmail'}) in this session
               and will find transaction emails and add them here automatically.
             </p>
           </div>
