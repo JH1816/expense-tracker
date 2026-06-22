@@ -1,18 +1,25 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from models import db, Expense, Category
+from models import db, Expense, Category, User
 from datetime import datetime
 from sqlalchemy import func, extract
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from functools import wraps
 import calendar
 import os
+import requests as req
 
 app = Flask(__name__)
-CORS(app, origins=['http://localhost:5173', 'http://localhost:3000'])
+CORS(app,
+     origins=['http://localhost:5173', 'http://localhost:3000'],
+     allow_headers=['Content-Type', 'Authorization'])
 
 basedir = os.path.abspath(os.path.dirname(__file__))
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(basedir, "expenses.db")}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = 'dev-secret-key-change-in-prod'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-prod')
+
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 
 db.init_app(app)
 
@@ -31,23 +38,126 @@ DEFAULT_CATEGORIES = [
 
 with app.app_context():
     db.create_all()
-    if Category.query.count() == 0:
+
+    # Migrate: add user_id columns to existing tables if absent
+    with db.engine.connect() as conn:
+        for sql in [
+            "ALTER TABLE categories ADD COLUMN user_id INTEGER REFERENCES users(id)",
+            "ALTER TABLE expenses ADD COLUMN user_id INTEGER REFERENCES users(id)",
+        ]:
+            try:
+                conn.execute(db.text(sql))
+                conn.commit()
+            except Exception:
+                pass  # Column already exists
+
+    # Seed global default categories (user_id=NULL) on fresh install
+    if Category.query.filter_by(user_id=None).count() == 0:
         for cat_data in DEFAULT_CATEGORIES:
             db.session.add(Category(**cat_data))
         db.session.commit()
 
 
+# ── Auth middleware ────────────────────────────────────────────────────────
+
+def _serializer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='auth')
+
+
+def make_token(user_id, email):
+    return _serializer().dumps({'user_id': user_id, 'email': email})
+
+
+def verify_token(token, max_age=86400 * 30):  # 30 days
+    return _serializer().loads(token, max_age=max_age)
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get('Authorization', '')
+        if not auth.startswith('Bearer '):
+            return jsonify({'error': 'Unauthorized'}), 401
+        try:
+            payload = verify_token(auth[7:])
+            g.user_id = payload['user_id']
+        except (BadSignature, SignatureExpired, Exception):
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ── Auth routes ───────────────────────────────────────────────────────────
+
+@app.route('/api/auth/google', methods=['POST'])
+def google_auth():
+    credential = request.json.get('credential')
+    if not credential:
+        return jsonify({'error': 'No credential provided'}), 400
+    if not GOOGLE_CLIENT_ID:
+        return jsonify({'error': 'GOOGLE_CLIENT_ID not configured on server'}), 500
+
+    try:
+        resp = req.get(
+            'https://oauth2.googleapis.com/tokeninfo',
+            params={'id_token': credential},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return jsonify({'error': 'Token verification failed'}), 400
+        info = resp.json()
+        if info.get('aud') != GOOGLE_CLIENT_ID:
+            return jsonify({'error': 'Token audience mismatch'}), 400
+    except Exception as e:
+        return jsonify({'error': f'Token verification failed: {str(e)}'}), 400
+
+    user = User.query.filter_by(google_id=info['sub']).first()
+
+    if user is None:
+        user = User(
+            google_id=info['sub'],
+            email=info['email'],
+            name=info.get('name', ''),
+            picture=info.get('picture', ''),
+        )
+        db.session.add(user)
+        db.session.flush()
+
+        # First user: claim any existing expenses that have no owner
+        Expense.query.filter_by(user_id=None).update({'user_id': user.id})
+        db.session.commit()
+    else:
+        user.name = info.get('name', user.name)
+        user.picture = info.get('picture', user.picture)
+        db.session.commit()
+
+    token = make_token(user.id, user.email)
+    return jsonify({'token': token, 'user': user.to_dict()})
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@require_auth
+def auth_me():
+    user = db.get_or_404(User, g.user_id)
+    return jsonify(user.to_dict())
+
+
 # ── Categories ─────────────────────────────────────────────────────────────
 
 @app.route('/api/categories', methods=['GET'])
+@require_auth
 def get_categories():
-    cats = Category.query.order_by(Category.name).all()
+    # Global categories (user_id=NULL) + this user's custom categories
+    cats = Category.query.filter(
+        db.or_(Category.user_id == g.user_id, Category.user_id == None)
+    ).order_by(Category.name).all()
+
     result = []
     for cat in cats:
         d = cat.to_dict()
         d['total_spent'] = round(
             db.session.query(func.sum(Expense.amount))
-            .filter(Expense.category_id == cat.id)
+            .filter(Expense.category_id == cat.id, Expense.user_id == g.user_id)
             .scalar() or 0, 2
         )
         result.append(d)
@@ -55,6 +165,7 @@ def get_categories():
 
 
 @app.route('/api/categories', methods=['POST'])
+@require_auth
 def create_category():
     data = request.json
     cat = Category(
@@ -62,6 +173,7 @@ def create_category():
         color=data.get('color', '#6b7280'),
         icon=data.get('icon', '📦'),
         budget=data.get('budget'),
+        user_id=g.user_id,
     )
     db.session.add(cat)
     db.session.commit()
@@ -69,6 +181,7 @@ def create_category():
 
 
 @app.route('/api/categories/<int:cat_id>', methods=['PUT'])
+@require_auth
 def update_category(cat_id):
     cat = db.get_or_404(Category, cat_id)
     data = request.json
@@ -83,8 +196,9 @@ def update_category(cat_id):
 # ── Expenses ───────────────────────────────────────────────────────────────
 
 @app.route('/api/expenses', methods=['GET'])
+@require_auth
 def get_expenses():
-    query = Expense.query
+    query = Expense.query.filter_by(user_id=g.user_id)
 
     month = request.args.get('month', type=int)
     year = request.args.get('year', type=int)
@@ -117,11 +231,12 @@ def get_expenses():
 
 
 @app.route('/api/expenses', methods=['POST'])
+@require_auth
 def create_expense():
     data = request.json
 
     email_id = data.get('email_id')
-    if email_id and Expense.query.filter_by(email_id=email_id).first():
+    if email_id and Expense.query.filter_by(email_id=email_id, user_id=g.user_id).first():
         return jsonify({'skipped': True, 'message': 'Duplicate email_id'}), 200
 
     date_str = data.get('date', datetime.now().isoformat())
@@ -139,6 +254,7 @@ def create_expense():
         source=data.get('source', 'manual'),
         email_id=email_id,
         currency=data.get('currency', 'SGD'),
+        user_id=g.user_id,
     )
     db.session.add(expense)
     db.session.commit()
@@ -146,8 +262,11 @@ def create_expense():
 
 
 @app.route('/api/expenses/<int:exp_id>', methods=['PUT'])
+@require_auth
 def update_expense(exp_id):
     expense = db.get_or_404(Expense, exp_id)
+    if expense.user_id != g.user_id:
+        return jsonify({'error': 'Forbidden'}), 403
     data = request.json
 
     if 'amount' in data:
@@ -171,8 +290,11 @@ def update_expense(exp_id):
 
 
 @app.route('/api/expenses/<int:exp_id>', methods=['DELETE'])
+@require_auth
 def delete_expense(exp_id):
     expense = db.get_or_404(Expense, exp_id)
+    if expense.user_id != g.user_id:
+        return jsonify({'error': 'Forbidden'}), 403
     db.session.delete(expense)
     db.session.commit()
     return '', 204
@@ -181,6 +303,7 @@ def delete_expense(exp_id):
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.route('/api/dashboard', methods=['GET'])
+@require_auth
 def dashboard():
     now = datetime.now()
     month = request.args.get('month', now.month, type=int)
@@ -188,6 +311,7 @@ def dashboard():
 
     def month_expenses(y, m):
         return Expense.query.filter(
+            Expense.user_id == g.user_id,
             extract('year', Expense.date) == y,
             extract('month', Expense.date) == m,
         ).all()
@@ -201,7 +325,6 @@ def dashboard():
     prev_y = year if month > 1 else year - 1
     prev_total = sum(e.amount for e in month_expenses(prev_y, prev_m))
 
-    # By category
     cat_map = {}
     for e in current:
         cat = e.category_rel
@@ -223,7 +346,6 @@ def dashboard():
         reverse=True,
     )
 
-    # Daily spending
     daily_map = {}
     for e in current:
         d = e.date.day
@@ -235,7 +357,6 @@ def dashboard():
         for d in range(1, days_in_month + 1)
     ]
 
-    # Monthly trend (last 6 months)
     monthly_trend = []
     for i in range(5, -1, -1):
         total_months = (year * 12 + month - 1) - i
@@ -247,7 +368,13 @@ def dashboard():
             'amount': round(m_total, 2),
         })
 
-    recent = Expense.query.order_by(Expense.date.desc()).limit(5).all()
+    recent = (
+        Expense.query
+        .filter_by(user_id=g.user_id)
+        .order_by(Expense.date.desc())
+        .limit(5)
+        .all()
+    )
 
     return jsonify({
         'total': round(total, 2),
@@ -264,20 +391,25 @@ def dashboard():
 # ── Gmail sync endpoint ────────────────────────────────────────────────────
 
 @app.route('/api/gmail/sync', methods=['POST'])
+@require_auth
 def gmail_sync_receive():
-    """Accept parsed expenses from Claude's Gmail scan."""
     data = request.json
     expenses = data.get('expenses', [])
     added, skipped = 0, 0
 
     for exp in expenses:
-        if exp.get('email_id') and Expense.query.filter_by(email_id=exp['email_id']).first():
+        if exp.get('email_id') and Expense.query.filter_by(
+            email_id=exp['email_id'], user_id=g.user_id
+        ).first():
             skipped += 1
             continue
 
         cat = None
         if exp.get('category'):
-            cat = Category.query.filter_by(name=exp['category']).first()
+            cat = Category.query.filter(
+                Category.name == exp['category'],
+                db.or_(Category.user_id == g.user_id, Category.user_id == None),
+            ).first()
 
         try:
             exp_date = datetime.fromisoformat(exp.get('date', datetime.now().isoformat()))
@@ -293,6 +425,7 @@ def gmail_sync_receive():
             source='gmail',
             email_id=exp.get('email_id'),
             currency=exp.get('currency', 'SGD'),
+            user_id=g.user_id,
         )
         db.session.add(row)
         added += 1
